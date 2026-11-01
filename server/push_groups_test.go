@@ -14,6 +14,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
+	"io"
 	"math/big"
 	"slices"
 	"sync"
@@ -274,10 +275,15 @@ func TestPushHTTPSGroup(t *testing.T) {
 	// TLS client certificates are validated against the HTTPS trust list.
 	client, err := testpki.NewIdentity(testpki.CurveP256, "tls client", "", ca.X509, ca.Key)
 	require.NoError(t, err)
-	require.NoError(t, cfg.VerifyPeerCertificate(nil, nil))
-	require.NoError(t, cfg.VerifyPeerCertificate([][]byte{client.Cert}, nil))
-	require.Equal(t, ua.StatusBadCertificateUntrusted, cfg.VerifyPeerCertificate([][]byte{p.ClientCert}, nil))
-	require.Equal(t, ua.StatusBadCertificateInvalid, cfg.VerifyPeerCertificate([][]byte{{1, 2}}, nil))
+	peer := func(der []byte) tls.ConnectionState {
+		c, err := x509.ParseCertificate(der)
+		require.NoError(t, err)
+		return tls.ConnectionState{PeerCertificates: []*x509.Certificate{c}}
+	}
+	require.NoError(t, cfg.VerifyConnection(tls.ConnectionState{}))
+	require.NoError(t, cfg.VerifyConnection(peer(client.Cert)))
+	require.Equal(t, ua.StatusBadCertificateUntrusted, cfg.VerifyConnection(peer(p.ClientCert)))
+	require.Equal(t, ua.StatusBadCertificateInvalid, s.push.verifyTLSClient([][]byte{{1, 2}}))
 	require.Contains(t, s.RejectedCertificates(), p.ClientCert)
 
 	req2 := s.push.tlsConfig(&tls.Config{})
@@ -286,7 +292,7 @@ func TestPushHTTPSGroup(t *testing.T) {
 	require.Equal(t, tls.RequireAnyClientCert, s.push.tlsConfig(&tls.Config{}).ClientAuth)
 	s.push.cfg.HTTPSClientCertificates = HTTPSClientCertificatesIgnore
 	ign := s.push.tlsConfig(&tls.Config{ClientAuth: tls.NoClientCert})
-	require.Nil(t, ign.VerifyPeerCertificate)
+	require.Nil(t, ign.VerifyConnection)
 
 	// Without a certificate of the group the TLS configuration's own is
 	// used.
@@ -953,4 +959,97 @@ func TestPushEd448SigningRequest(t *testing.T) {
 		require.Equal(t, cert, got)
 		require.True(t, uapolicy.KeyMatchesCertificate(key, cert))
 	}
+}
+
+// A certificate that left the DefaultHttpsGroup trust list must not get back in
+// with a TLS session saved while it was trusted: crypto/tls resumes such a
+// session without calling VerifyPeerCertificate.
+func TestPushHTTPSTrustOnResumedConnection(t *testing.T) {
+	for name, version := range map[string]uint16{"TLS 1.2": tls.VersionTLS12, "TLS 1.3": tls.VersionTLS13} {
+		t.Run(name, func(t *testing.T) {
+			ca, err := testpki.NewCA(testpki.CurveP256, "tls ca")
+			require.NoError(t, err)
+			other, err := testpki.NewCA(testpki.CurveP256, "other ca")
+			require.NoError(t, err)
+			s := newPushServer(t, PushManagement{HTTPSClientCertificates: HTTPSClientCertificatesRequire,
+				HTTPSTrustList: &ua.TrustListDataType{TrustedCertificates: [][]byte{ca.Cert}}})
+			replacement := newPushServer(t, PushManagement{HTTPSClientCertificates: HTTPSClientCertificatesRequire,
+				HTTPSTrustList: &ua.TrustListDataType{TrustedCertificates: [][]byte{other.Cert}}})
+
+			ln, err := tls.Listen("tcp", "127.0.0.1:0", s.push.tlsConfig(&tls.Config{MaxVersion: version}))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = ln.Close() })
+			go func() {
+				for {
+					c, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					go func() {
+						defer func() { _ = c.Close() }()
+						if c.(*tls.Conn).Handshake() == nil {
+							_, _ = c.Write([]byte("ok"))
+						}
+					}()
+				}
+			}()
+
+			client, err := testpki.NewIdentity(testpki.CurveP256, "tls client", "", ca.X509, ca.Key)
+			require.NoError(t, err)
+			cache := tls.NewLRUClientSessionCache(4)
+			dial := func() (resumed bool, err error) {
+				c, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{
+					InsecureSkipVerify: true, // the test is about the server's check of the client
+					MaxVersion:         version,
+					Certificates:       []tls.Certificate{{Certificate: [][]byte{client.Cert}, PrivateKey: client.Key}},
+					ClientSessionCache: cache,
+				})
+				if err != nil {
+					return false, err
+				}
+				defer func() { _ = c.Close() }()
+				// Reading also takes in the TLS 1.3 session ticket.
+				if _, err := io.ReadFull(c, make([]byte, 2)); err != nil {
+					return false, err
+				}
+				return c.ConnectionState().DidResume, nil
+			}
+
+			resumed, err := dial()
+			require.NoError(t, err)
+			require.False(t, resumed)
+			resumed, err = dial()
+			require.NoError(t, err)
+			require.True(t, resumed, "a trusted client resumes as before")
+
+			s.push.groups[groupHTTPS].trust.Store(replacement.push.groups[groupHTTPS].trust.Load())
+			_, err = dial()
+			require.Error(t, err, "the saved session must not get past the new trust list")
+		})
+	}
+}
+
+// A VerifyConnection of the caller's TLS configuration still runs, after the
+// trust list.
+func TestPushHTTPSKeepsVerifyConnection(t *testing.T) {
+	ca, err := testpki.NewCA(testpki.CurveP256, "tls ca")
+	require.NoError(t, err)
+	client, err := testpki.NewIdentity(testpki.CurveP256, "tls client", "", ca.X509, ca.Key)
+	require.NoError(t, err)
+	s := newPushServer(t, PushManagement{HTTPSClientCertificates: HTTPSClientCertificatesRequire,
+		HTTPSTrustList: &ua.TrustListDataType{TrustedCertificates: [][]byte{ca.Cert}}})
+	refused := errors.New("refused by the caller")
+	calls := 0
+	cfg := s.push.tlsConfig(&tls.Config{VerifyConnection: func(tls.ConnectionState) error {
+		calls++
+		return refused
+	}})
+	cert, err := x509.ParseCertificate(client.Cert)
+	require.NoError(t, err)
+	require.ErrorIs(t, cfg.VerifyConnection(tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}), refused)
+	require.Equal(t, 1, calls)
+	bad, err := x509.ParseCertificate(pushPKI(t).ClientCert)
+	require.NoError(t, err)
+	require.Equal(t, ua.StatusBadCertificateUntrusted, cfg.VerifyConnection(tls.ConnectionState{PeerCertificates: []*x509.Certificate{bad}}))
+	require.Equal(t, 1, calls, "an untrusted certificate stops at the trust list")
 }

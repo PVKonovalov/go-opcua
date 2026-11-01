@@ -425,9 +425,9 @@ GetRejectedList.
   validates client application certificates, the DefaultUserTokenGroup one
   X.509 user identity tokens (before a `WithX509UserValidator` is asked), and
   the DefaultHttpsGroup one TLS client certificates of the opc.https / opc.wss
-  endpoints when `HTTPSClientCertificates` asks for them. The HTTPS group
-  certificate is the TLS certificate; it is swapped at ApplyChanges without a
-  restart.
+  endpoints when `HTTPSClientCertificates` asks for them, on every connection,
+  resumed ones included. The HTTPS group certificate is the TLS certificate; it
+  is swapped at ApplyChanges without a restart.
 - **PFX private keys** carry no password in Part 12: the server asks
   `PushManagement.PFXPassword`. A wrong password is `Bad_SecurityChecksFailed`.
 - **TransactionDiagnostics** are readable by SecurityAdmin sessions only.

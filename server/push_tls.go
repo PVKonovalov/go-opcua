@@ -8,7 +8,6 @@ import (
 	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/tls"
-	"crypto/x509"
 	"slices"
 
 	"github.com/otfabric/go-opcua/ua"
@@ -102,8 +101,23 @@ func (m *pushManager) tlsConfig(base *tls.Config) *tls.Config {
 		return cfg
 	}
 	cfg.ClientCAs = nil
-	cfg.VerifyPeerCertificate = func(raw [][]byte, _ [][]*x509.Certificate) error {
-		return m.verifyTLSClient(raw)
+	// VerifyConnection and not VerifyPeerCertificate: crypto/tls does not call
+	// the latter on resumed connections, and a client removed from the trust
+	// list could reconnect with a session it saved before.
+	cfg.VerifyPeerCertificate = nil
+	next := cfg.VerifyConnection
+	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+		raw := make([][]byte, len(cs.PeerCertificates))
+		for i, c := range cs.PeerCertificates {
+			raw[i] = c.Raw
+		}
+		if err := m.verifyTLSClient(raw); err != nil {
+			return err
+		}
+		if next != nil {
+			return next(cs)
+		}
+		return nil
 	}
 	return cfg
 }

@@ -1,5 +1,20 @@
 # go-opcua Releases
 
+## v1.29.3
+
+**Date:** unreleased
+**Previous release:** v1.29.2
+
+### Security
+
+- A TLS client certificate removed from the DefaultHttpsGroup trust list could still connect to `opc.https` and `opc.wss` endpoints by resuming a TLS session saved while it was trusted, with `HTTPSClientCertificates` set to verify or require. The trust list is now checked on every connection. Affects v1.18.0 to v1.29.2. See advisory GHSA-5mpv-gmwr-mmh5.
+
+### Changed
+
+- With `HTTPSClientCertificates` set to verify or require, the check runs in `tls.Config.VerifyConnection`. A `VerifyConnection` in the given TLS configuration still runs, after the trust list.
+
+---
+
 ## v1.29.2
 
 **Date:** 2026-10-31
