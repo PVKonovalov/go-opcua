@@ -372,14 +372,18 @@ func (s *AttributeService) Write(ctx context.Context, sc *uasc.SecureChannel, r 
 				status[i] = st
 				continue
 			}
-			status[i] = ns.SetAttribute(n.NodeID, n.AttributeID, &ua.DataValue{
+			status[i] = ns.SetAttribute(n.NodeID, n.AttributeID, stampWritten(&ua.DataValue{
 				EncodingMask: ua.DataValueValue,
 				Value:        merged,
-			})
+			}, time.Now()))
 			continue
 		}
 
-		status[i] = ns.SetAttribute(n.NodeID, n.AttributeID, n.Value)
+		val := n.Value
+		if n.AttributeID == ua.AttributeIDValue && val != nil {
+			val = stampWritten(val, time.Now())
+		}
+		status[i] = ns.SetAttribute(n.NodeID, n.AttributeID, val)
 
 	}
 	response := &ua.WriteResponse{
@@ -397,6 +401,24 @@ func (s *AttributeService) Write(ctx context.Context, sc *uasc.SecureChannel, r 
 
 	return response, nil
 
+}
+
+// stampWritten returns a copy of a DataValue a client wrote to a Value
+// Attribute with the time the server received it as its SourceTimestamp.
+// The SourceTimestamp "should indicate the time of the last change of the
+// value" (Part 4 §7.11.3): the write is that change, and the server applies
+// the timestamp because the client cannot (Write answers
+// Bad_WriteNotSupported for timestamps, §5.11.4.2). UA-.NETStandard
+// (BaseVariableState) also stamps the SourceTimestamp of a write with the
+// time of the write. The ServerTimestamp, the time the server "knew it to be
+// accurate" (§7.11.4), is left to the Read, the sampling of a monitored item
+// and the PubSub publisher, which stamp the time they take the value.
+func stampWritten(dv *ua.DataValue, now time.Time) *ua.DataValue {
+	cp := *dv
+	cp.SourceTimestamp = now.UTC()
+	cp.SourcePicoseconds = 0
+	cp.EncodingMask = cp.EncodingMask&^ua.DataValueSourcePicoseconds | ua.DataValueSourceTimestamp
+	return &cp
 }
 
 // HistoryUpdate implements the OPC UA HistoryUpdate service.

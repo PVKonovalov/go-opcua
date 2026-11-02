@@ -5,6 +5,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -32,7 +33,7 @@ type SessionService struct {
 }
 
 // CreateSession implements the OPC UA CreateSession service.
-// https://reference.opcfoundation.org/Core/Part4/v105/docs/5.6.2
+// https://reference.opcfoundation.org/Core/Part4/v105/docs/5.7.2
 func (s *SessionService) CreateSession(ctx context.Context, sc *uasc.SecureChannel, r ua.Request, reqID uint32) (ua.Response, error) {
 	s.srv.cfg.logger.Info("handling CreateSession request")
 
@@ -68,14 +69,23 @@ func (s *SessionService) CreateSession(ctx context.Context, sc *uasc.SecureChann
 	}
 	sess.serverNonce = nonce
 	sess.clientNonce = req.ClientNonce
-	sess.remoteCertificate = req.ClientCertificate
+
+	// "If the securityPolicyUri is None, the Server shall ignore the
+	// ApplicationInstanceCertificate" (Part 4 §5.7.2.2): it is neither
+	// checked against the trust list nor kept as the certificate of the
+	// session. Some clients (node-opcua) send theirs anyway.
+	clientCert := req.ClientCertificate
+	if sc != nil && sc.SecurityPolicyURI() == ua.SecurityPolicyURINone {
+		clientCert = nil
+	}
+	sess.remoteCertificate = clientCert
 
 	// Validate the client's application certificate against the server's
-	// configured trust store (OPC UA Part 4 §5.6.3). Skip validation when no
-	// validator is configured (the secure channel still enforces message
+	// configured trust store (Part 4 §5.7.2.2, §6.1.3). Skip validation when
+	// no validator is configured (the secure channel still enforces message
 	// integrity; this is an additional application-level trust check).
-	if s.srv.cfg.clientCertificateValidator != nil && len(req.ClientCertificate) > 0 {
-		if err := s.srv.cfg.clientCertificateValidator(req.ClientCertificate); err != nil {
+	if s.srv.cfg.clientCertificateValidator != nil && len(clientCert) > 0 {
+		if err := s.srv.cfg.clientCertificateValidator(clientCert); err != nil {
 			s.srv.cfg.logger.Warn("client certificate rejected", "error", err)
 			// The client never learns of the session: do not keep it
 			// until its timeout.
@@ -384,7 +394,9 @@ func (s *SessionService) checkChannelSecurity(sc *uasc.SecureChannel) ua.StatusC
 // When the token carries no EncryptionAlgorithm the password is already clear
 // text (unsecured token policy). Otherwise the secret was encrypted with the
 // server certificate's public key using the asymmetric algorithm of the
-// SecureChannel's security policy and has the layout (Part 4 §7.41.2.3):
+// security policy of the token policy, which is that of the SecureChannel
+// unless the token policy names one (see tokenSecurityPolicy), and has the
+// layout (Part 4 §7.41.2.3):
 //
 //	UInt32 length | password bytes | serverNonce
 //
@@ -404,13 +416,16 @@ func (s *SessionService) decryptUserPassword(sc *uasc.SecureChannel, sess *sessi
 	if sc == nil {
 		return nil, ua.StatusBadIdentityTokenInvalid
 	}
-	policyURI := sc.SecurityPolicyURI()
-	if policyURI == ua.SecurityPolicyURINone {
+	policyURI := s.tokenSecurityPolicy(sc, tok.PolicyID)
+	if policyURI == ua.SecurityPolicyURINone || uapolicy.IsECC(policyURI) {
 		return nil, ua.StatusBadIdentityTokenInvalid
 	}
 	// The key of the channel: after push certificate management replaced
 	// the certificate, a channel opened before keeps the key it has.
-	key := sc.LocalPrivateKey()
+	var key crypto.PrivateKey
+	if policyURI == sc.SecurityPolicyURI() {
+		key = sc.LocalPrivateKey()
+	}
 	if key == nil {
 		_, k, ok := s.srv.cfg.identityFor(policyURI)
 		if !ok || k == nil {
@@ -558,9 +573,28 @@ func (s *SessionService) serverCertificate(sc *uasc.SecureChannel) []byte {
 	return cert
 }
 
-// userTokenPolicy returns the security policy that protects the user identity
-// tokens of a channel. The UserTokenPolicies of this server do not name a
-// policy of their own, so it is the policy of the SecureChannel.
+// tokenSecurityPolicy returns the security policy that protects a user
+// identity token with the PolicyId policyID: the SecurityPolicyUri of the
+// UserTokenPolicy if it names one, the policy of the SecureChannel if it
+// does not (Part 4 §7.41). Only the UserName policies of opc.https and
+// opc.wss endpoints name one (see Server.tokenPolicyOverTLS).
+func (s *SessionService) tokenSecurityPolicy(sc *uasc.SecureChannel, policyID string) string {
+	if policyID != "" {
+		for _, ep := range s.srv.Endpoints() {
+			for _, utp := range ep.UserIdentityTokens {
+				if utp != nil && utp.PolicyID == policyID && utp.SecurityPolicyURI != "" {
+					return utp.SecurityPolicyURI
+				}
+			}
+		}
+	}
+	return s.userTokenPolicy(sc)
+}
+
+// userTokenPolicy returns the security policy of a channel, which protects
+// its user identity tokens unless their UserTokenPolicy names another one
+// (see tokenSecurityPolicy). ECC policies are never named by a
+// UserTokenPolicy of this server.
 func (s *SessionService) userTokenPolicy(sc *uasc.SecureChannel) string {
 	if sc == nil {
 		return ua.SecurityPolicyURINone

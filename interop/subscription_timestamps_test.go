@@ -28,9 +28,9 @@ func TestGoServer_SubscribeTimestampsToReturn(t *testing.T) {
 		writeVal   int32
 	}{
 		{"Neither", ua.TimestampsToReturnNeither, false, false, 101},
-		{"Source", ua.TimestampsToReturnSource, false, false, 102}, // no source stored on node → absent
+		{"Source", ua.TimestampsToReturnSource, true, false, 102},
 		{"Server", ua.TimestampsToReturnServer, false, true, 103},
-		{"Both", ua.TimestampsToReturnBoth, false, true, 104},
+		{"Both", ua.TimestampsToReturnBoth, true, true, 104},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -38,6 +38,10 @@ func TestGoServer_SubscribeTimestampsToReturn(t *testing.T) {
 			_, nsIdx := findNS(t, c)
 			ctx := shortTestCtx(t)
 			nodeID := ua.NewStringNodeID(nsIdx, "Access.ReadWrite")
+
+			// A written value carries the SourceTimestamp the server stamped
+			// (Part 4 §7.11.3), whatever case ran before.
+			writeInt32(t, c, ctx, nodeID, tc.writeVal+1000)
 
 			req := opcua.NewMonitoredItemCreateRequestWithDefaults(nodeID, ua.AttributeIDValue, 1)
 			req.RequestedParameters.QueueSize = 1
@@ -67,6 +71,9 @@ func TestGoServer_SubscribeTimestampsToReturn(t *testing.T) {
 			writeInt32(t, c, ctx, nodeID, tc.writeVal)
 			dcn2 := collectDataChange(t, notifyCh, 1, 5*time.Second)
 			dv2 := dcn2.MonitoredItems[0].Value
+			if hasSrc2 := dv2.EncodingMask&ua.DataValueSourceTimestamp != 0; hasSrc2 != tc.wantSrc {
+				t.Errorf("subsequent source timestamp present=%v, want %v", hasSrc2, tc.wantSrc)
+			}
 			hasSrv2 := dv2.EncodingMask&ua.DataValueServerTimestamp != 0
 			if hasSrv2 != tc.wantServer {
 				t.Errorf("subsequent server timestamp present=%v, want %v", hasSrv2, tc.wantServer)
